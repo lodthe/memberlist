@@ -1,8 +1,10 @@
 package memberlist
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -633,6 +635,195 @@ func TestMemberlist_Join(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected err: %s", err)
 	}
+
+	// Check the hosts
+	if len(m2.Members()) != 2 {
+		t.Fatalf("should have 2 nodes! %v", m2.Members())
+	}
+	if m2.estNumNodes() != 2 {
+		t.Fatalf("should have 2 nodes! %v", m2.Members())
+	}
+}
+
+type testInterceptor struct {
+	Label string // len==4
+}
+
+func newTestInterceptor(t *testing.T, label string) *testInterceptor {
+	if label == "" {
+		return &testInterceptor{}
+	}
+
+	require.Len(t, label, 4)
+	return &testInterceptor{Label: label}
+}
+
+var _ Interceptor = (*testInterceptor)(nil)
+
+func (i *testInterceptor) InterceptInboundStream(r io.Reader) (out io.Reader, authData []byte, err error) {
+	bufConn, ok := r.(*bufio.Reader)
+	if !ok {
+		bufConn = bufio.NewReader(r)
+	}
+
+	// Check the message type first.
+	byte0, err := bufConn.ReadByte()
+	if err != nil {
+		return nil, nil, err
+	}
+	msgType := messageType(byte0)
+
+	if msgType != hasLabelMsg {
+		if err := bufConn.UnreadByte(); err != nil {
+			return nil, nil, err
+		}
+		if i.Label != "" {
+			return nil, nil, fmt.Errorf("expected label header %q", i.Label)
+		}
+		return bufConn, nil, nil
+	}
+
+	var raw [4]byte
+	if _, err = io.ReadFull(bufConn, raw[:]); err != nil {
+		return nil, nil, err
+	}
+	label := string(raw[:])
+
+	if i.Label != label {
+		return nil, nil, fmt.Errorf("label mismatch expected=%q got=%q", i.Label, label)
+	}
+
+	return bufConn, []byte(label), nil
+}
+
+func (i *testInterceptor) InterceptOutboundStream(w io.Writer) error {
+	if i.Label == "" {
+		return nil
+	}
+
+	header := make([]byte, 1, 1+len(i.Label))
+	header[0] = byte(hasLabelMsg)
+	header = append(header, []byte(i.Label)...)
+
+	_, err := w.Write(header)
+	return err
+}
+
+func (i *testInterceptor) InterceptInboundPacket(buf []byte) (out []byte, authData []byte, err error) {
+	if len(buf) < 5 {
+		return buf, nil, nil
+	}
+	if messageType(buf[0]) != hasLabelMsg {
+		if i.Label != "" {
+			return nil, nil, fmt.Errorf("expected label header %q", i.Label)
+		}
+		return buf, nil, nil
+	}
+
+	label := string(buf[1:5])
+	if i.Label != label {
+		return nil, nil, fmt.Errorf("label mismatch expected=%q got=%q", i.Label, label)
+	}
+
+	return buf[5:], []byte(label), nil
+}
+
+func (i *testInterceptor) InterceptOutboundPacket(buf []byte) ([]byte, error) {
+	if i.Label == "" {
+		return buf, nil
+	}
+
+	var newBuf bytes.Buffer
+	newBuf.Grow(1 + len(i.Label) + len(buf))
+	newBuf.Write([]byte{byte(hasLabelMsg)})
+	newBuf.Write([]byte(i.Label))
+	newBuf.Write(buf)
+	return newBuf.Bytes(), nil
+}
+
+func (i *testInterceptor) InterceptionOverhead() int {
+	return 5
+}
+
+func (i *testInterceptor) InterceptionAuthData() []byte {
+	return []byte(i.Label)
+}
+
+func Test_TestInterceptor_behavior(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		test_TestInterceptor_behavior(t, "")
+	})
+	t.Run("non-default", func(t *testing.T) {
+		test_TestInterceptor_behavior(t, "food")
+	})
+}
+func test_TestInterceptor_behavior(t *testing.T, label string) {
+	ti := newTestInterceptor(t, label)
+
+	t.Run("packet", func(t *testing.T) {
+		message := []byte("hello world")
+		out, err := ti.InterceptOutboundPacket(message)
+		require.NoError(t, err)
+
+		got, data, err := ti.InterceptInboundPacket(out)
+		require.NoError(t, err)
+		require.Equal(t, message, got)
+		require.Equal(t, label, string(data))
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		message := []byte("hello world")
+
+		var outConn bytes.Buffer
+		require.NoError(t, ti.InterceptOutboundStream(&outConn))
+		_, err := outConn.Write(message)
+		require.NoError(t, err)
+		out := outConn.Bytes()
+
+		inConn := bytes.NewBuffer(out)
+
+		rest, data, err := ti.InterceptInboundStream(inConn)
+		require.NoError(t, err)
+		require.Equal(t, label, string(data))
+
+		got, err := ioutil.ReadAll(rest)
+		require.NoError(t, err)
+		require.Equal(t, message, got)
+	})
+}
+
+func TestMemberlist_Join_with_Interceptor(t *testing.T) {
+	secretKey := TestKeys[0]
+
+	// keyring1, err := NewKeyring(nil, secretKey)
+	// require.NoError(t, err)
+
+	c1 := testConfig(t)
+	// c1.Keyring = keyring1
+	c1.Interceptor = newTestInterceptor(t, "food")
+	c1.SecretKey = secretKey
+	m1, err := Create(c1)
+	require.NoError(t, err)
+	defer m1.Shutdown()
+
+	bindPort := m1.config.BindPort
+
+	// keyring2, err := NewKeyring(nil, secretKey)
+	// require.NoError(t, err)
+
+	// Create a second node
+	c2 := testConfig(t)
+	// c2.Keyring = keyring2
+	c2.Interceptor = newTestInterceptor(t, "food")
+	c2.BindPort = bindPort
+	c2.SecretKey = secretKey
+	m2, err := Create(c2)
+	require.NoError(t, err)
+	defer m2.Shutdown()
+
+	num, err := m2.Join([]string{m1.config.Name + "/" + m1.config.BindAddr})
+	require.NoError(t, err)
+	require.Equal(t, 1, num)
 
 	// Check the hosts
 	if len(m2.Members()) != 2 {

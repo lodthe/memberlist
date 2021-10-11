@@ -193,6 +193,8 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 			interceptor:        conf.Interceptor,
 			NodeAwareTransport: nodeAwareTransport,
 		}
+	} else {
+		conf.Interceptor = &noopInterceptor{}
 	}
 
 	m := &Memberlist{

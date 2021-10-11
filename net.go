@@ -236,7 +236,7 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 	metrics.IncrCounter([]string{"memberlist", "tcp", "accept"}, 1)
 
 	conn.SetDeadline(time.Now().Add(m.config.TCPTimeout))
-	msgType, bufConn, dec, err := m.readStream(conn, true)
+	msgType, bufConn, envelopeAuthData, dec, err := m.readStreamAtStart(bufio.NewReader(conn))
 	if err != nil {
 		if err != io.EOF {
 			m.logger.Printf("[ERR] memberlist: failed to receive: %s %s", err, LogConn(conn))
@@ -248,7 +248,7 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 				return
 			}
 
-			err = m.rawSendMsgStream(conn, out.Bytes())
+			err = m.rawSendMsgStream(conn, out.Bytes(), envelopeAuthData)
 			if err != nil {
 				m.logger.Printf("[ERR] memberlist: Failed to send error: %s %s", err, LogConn(conn))
 				return
@@ -279,7 +279,8 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			return
 		}
 
-		if err := m.sendLocalState(conn, join); err != nil {
+		// Since we didn't open the socket, we don't send any interceptor auth data.
+		if err := m.sendLocalState(conn, join, envelopeAuthData); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to push local state: %s %s", err, LogConn(conn))
 			return
 		}
@@ -307,7 +308,8 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			return
 		}
 
-		err = m.rawSendMsgStream(conn, out.Bytes())
+		// Since we didn't open the socket, we don't send any interceptor auth data.
+		err = m.rawSendMsgStream(conn, out.Bytes(), envelopeAuthData)
 		if err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to send ack: %s %s", err, LogConn(conn))
 			return
@@ -332,19 +334,20 @@ func (m *Memberlist) packetListen() {
 }
 
 func (m *Memberlist) ingestPacket(buf []byte, from net.Addr, timestamp time.Time) {
-	if m.interceptor != nil {
-		var err error
-		buf, err = m.interceptor.InterceptInboundPacket(buf)
-		if err != nil {
-			m.logger.Printf("[ERR] memberlist: %v %s", err, LogAddress(from))
-			return
-		}
+	var (
+		extraAuthData []byte
+		err           error
+	)
+	buf, extraAuthData, err = m.interceptor.InterceptInboundPacket(buf)
+	if err != nil {
+		m.logger.Printf("[ERR] memberlist: %v %s", err, LogAddress(from))
+		return
 	}
 
 	// Check if encryption is enabled
 	if m.config.EncryptionEnabled() {
 		// Decrypt the payload
-		plain, err := decryptPayload(m.config.Keyring.GetKeys(), buf, nil)
+		plain, err := decryptPayload(m.config.Keyring.GetKeys(), buf, extraAuthData)
 		if err != nil {
 			if !m.config.GossipVerifyIncoming {
 				// Treat the message as plaintext
@@ -742,12 +745,9 @@ func (m *Memberlist) encodeAndSendMsg(a Address, msgType messageType, msg interf
 // opportunistically create a compoundMsg and piggy back other broadcasts.
 func (m *Memberlist) sendMsg(a Address, msg []byte) error {
 	// Check if we can piggy back any messages
-	bytesAvail := m.config.UDPBufferSize - len(msg) - compoundHeaderOverhead
+	bytesAvail := m.config.UDPBufferSize - len(msg) - compoundHeaderOverhead - m.interceptor.InterceptionOverhead()
 	if m.config.EncryptionEnabled() && m.config.GossipVerifyOutgoing {
 		bytesAvail -= encryptOverhead(m.encryptionVersion())
-	}
-	if m.interceptor != nil {
-		bytesAvail -= m.interceptor.InterceptionOverhead()
 	}
 	extra := m.getBroadcasts(compoundOverhead, bytesAvail)
 
@@ -817,9 +817,12 @@ func (m *Memberlist) rawSendMsgPacket(a Address, node *Node, msg []byte) error {
 	// Check if we have encryption enabled
 	if m.config.EncryptionEnabled() && m.config.GossipVerifyOutgoing {
 		// Encrypt the payload
-		var buf bytes.Buffer
-		primaryKey := m.config.Keyring.GetPrimaryKey()
-		err := encryptPayload(m.encryptionVersion(), primaryKey, msg, nil, &buf)
+		var (
+			primaryKey = m.config.Keyring.GetPrimaryKey()
+			authData   = m.interceptor.InterceptionAuthData()
+			buf        bytes.Buffer
+		)
+		err := encryptPayload(m.encryptionVersion(), primaryKey, msg, authData, &buf)
 		if err != nil {
 			m.logger.Printf("[ERR] memberlist: Encryption of message failed: %v", err)
 			return err
@@ -834,7 +837,7 @@ func (m *Memberlist) rawSendMsgPacket(a Address, node *Node, msg []byte) error {
 
 // rawSendMsgStream is used to stream a message to another host without
 // modification, other than applying compression and encryption if enabled.
-func (m *Memberlist) rawSendMsgStream(conn net.Conn, sendBuf []byte) error {
+func (m *Memberlist) rawSendMsgStream(conn net.Conn, sendBuf []byte, envelopeAuthData []byte) error {
 	// Check if compression is enabled
 	if m.config.EnableCompression {
 		compBuf, err := compressPayload(sendBuf)
@@ -847,7 +850,7 @@ func (m *Memberlist) rawSendMsgStream(conn net.Conn, sendBuf []byte) error {
 
 	// Check if encryption is enabled
 	if m.config.EncryptionEnabled() && m.config.GossipVerifyOutgoing {
-		crypt, err := m.encryptLocalState(sendBuf)
+		crypt, err := m.encryptLocalState(sendBuf, envelopeAuthData)
 		if err != nil {
 			m.logger.Printf("[ERROR] memberlist: Failed to encrypt local state: %v", err)
 			return err
@@ -893,7 +896,9 @@ func (m *Memberlist) sendUserMsg(a Address, sendBuf []byte) error {
 	if _, err := bufConn.Write(sendBuf); err != nil {
 		return err
 	}
-	return m.rawSendMsgStream(conn, bufConn.Bytes())
+
+	authData := m.interceptor.InterceptionAuthData()
+	return m.rawSendMsgStream(conn, bufConn.Bytes(), authData)
 }
 
 // sendAndReceiveState is used to initiate a push/pull over a stream with a
@@ -913,12 +918,13 @@ func (m *Memberlist) sendAndReceiveState(a Address, join bool) ([]pushNodeState,
 	metrics.IncrCounter([]string{"memberlist", "tcp", "connect"}, 1)
 
 	// Send our state
-	if err := m.sendLocalState(conn, join); err != nil {
+	authData := m.interceptor.InterceptionAuthData()
+	if err := m.sendLocalState(conn, join, authData); err != nil {
 		return nil, nil, err
 	}
 
 	conn.SetDeadline(time.Now().Add(m.config.TCPTimeout))
-	msgType, bufConn, dec, err := m.readStream(conn, false)
+	msgType, bufConn, dec, err := m.readStreamInMiddle(bufio.NewReader(conn), authData)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -943,7 +949,7 @@ func (m *Memberlist) sendAndReceiveState(a Address, join bool) ([]pushNodeState,
 }
 
 // sendLocalState is invoked to send our local state over a stream connection.
-func (m *Memberlist) sendLocalState(conn net.Conn, join bool) error {
+func (m *Memberlist) sendLocalState(conn net.Conn, join bool, authData []byte) error {
 	// Setup a deadline
 	conn.SetDeadline(time.Now().Add(m.config.TCPTimeout))
 
@@ -1000,11 +1006,11 @@ func (m *Memberlist) sendLocalState(conn net.Conn, join bool) error {
 	}
 
 	// Get the send buffer
-	return m.rawSendMsgStream(conn, bufConn.Bytes())
+	return m.rawSendMsgStream(conn, bufConn.Bytes(), authData)
 }
 
 // encryptLocalState is used to help encrypt local state before sending
-func (m *Memberlist) encryptLocalState(sendBuf []byte) ([]byte, error) {
+func (m *Memberlist) encryptLocalState(sendBuf []byte, extraAuthData []byte) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// Write the encryptMsg byte
@@ -1017,9 +1023,15 @@ func (m *Memberlist) encryptLocalState(sendBuf []byte) ([]byte, error) {
 	binary.BigEndian.PutUint32(sizeBuf, uint32(encLen))
 	buf.Write(sizeBuf)
 
+	// Authenticated Data is:
+	//
+	//   [messageType; byte] [messageLength; uint32] [interceptor_data; optional]
+	//
+	dataBytes := appendBytes(buf.Bytes()[:5], extraAuthData)
+
 	// Write the encrypted cipher text to the buffer
 	key := m.config.Keyring.GetPrimaryKey()
-	err := encryptPayload(encVsn, key, sendBuf, buf.Bytes()[:5], &buf)
+	err := encryptPayload(encVsn, key, sendBuf, dataBytes, &buf)
 	if err != nil {
 		return nil, err
 	}
@@ -1027,7 +1039,7 @@ func (m *Memberlist) encryptLocalState(sendBuf []byte) ([]byte, error) {
 }
 
 // decryptRemoteState is used to help decrypt the remote state
-func (m *Memberlist) decryptRemoteState(bufConn io.Reader) ([]byte, error) {
+func (m *Memberlist) decryptRemoteState(bufConn io.Reader, authData []byte) ([]byte, error) {
 	// Read in enough to determine message length
 	cipherText := bytes.NewBuffer(nil)
 	cipherText.WriteByte(byte(encryptMsg))
@@ -1049,8 +1061,13 @@ func (m *Memberlist) decryptRemoteState(bufConn io.Reader) ([]byte, error) {
 		return nil, err
 	}
 
-	// Decrypt the cipherText
-	dataBytes := cipherText.Bytes()[:5]
+	// Decrypt the cipherText with some authenticated data
+	//
+	// Authenticated Data is:
+	//
+	//   [messageType; byte] [messageLength; uint32] [interceptor_data; optional]
+	//
+	dataBytes := appendBytes(cipherText.Bytes()[:5], authData)
 	cipherBytes := cipherText.Bytes()[5:]
 
 	// Decrypt the payload
@@ -1058,20 +1075,32 @@ func (m *Memberlist) decryptRemoteState(bufConn io.Reader) ([]byte, error) {
 	return decryptPayload(keys, cipherBytes, dataBytes)
 }
 
-// readStream is used to read from a stream connection, decrypting and
-// decompressing the stream if necessary.
-func (m *Memberlist) readStream(conn net.Conn, doIntercept bool) (messageType, io.Reader, *codec.Decoder, error) {
-	// Created a buffered reader
-	var bufConn io.Reader = bufio.NewReader(conn)
-
-	if doIntercept && m.config.Interceptor != nil {
-		var err error
-		bufConn, err = m.config.Interceptor.InterceptInboundStream(bufConn)
-		if err != nil {
-			return 0, nil, nil, err
-		}
+// readStreamAtStart is used to read the FIRST message from a stream
+// connection, decrypting and decompressing the stream if necessary.
+//
+// NOTE: if we get a valid bit of envelope auth data we always return it, even
+// on an error.
+func (m *Memberlist) readStreamAtStart(bufConn io.Reader) (messageType, io.Reader, []byte, *codec.Decoder, error) {
+	bufConn, envelopeAuthData, err := m.interceptor.InterceptInboundStream(bufConn)
+	if err != nil {
+		return 0, nil, nil, nil, err
 	}
 
+	msgType, r, dec, err := m.readStream(bufConn, envelopeAuthData)
+	if err != nil {
+		return 0, nil, envelopeAuthData, nil, err
+	}
+	return msgType, r, envelopeAuthData, dec, nil
+}
+
+// readStreamInMiddle is used to read messages that aren't the FIRST message
+// from a stream connection, decrypting and decompressing the stream if
+// necessary.
+func (m *Memberlist) readStreamInMiddle(bufConn io.Reader, envelopeAuthData []byte) (messageType, io.Reader, *codec.Decoder, error) {
+	return m.readStream(bufConn, envelopeAuthData)
+}
+
+func (m *Memberlist) readStream(bufConn io.Reader, envelopeAuthData []byte) (messageType, io.Reader, *codec.Decoder, error) {
 	// Read the message type
 	buf := [1]byte{0}
 	if _, err := io.ReadFull(bufConn, buf[:]); err != nil {
@@ -1086,7 +1115,7 @@ func (m *Memberlist) readStream(conn net.Conn, doIntercept bool) (messageType, i
 				fmt.Errorf("Remote state is encrypted and encryption is not configured")
 		}
 
-		plain, err := m.decryptRemoteState(bufConn)
+		plain, err := m.decryptRemoteState(bufConn, envelopeAuthData)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -1266,11 +1295,12 @@ func (m *Memberlist) sendPingAndWaitForAck(a Address, ping ping, deadline time.T
 		return false, err
 	}
 
-	if err = m.rawSendMsgStream(conn, out.Bytes()); err != nil {
+	authData := m.interceptor.InterceptionAuthData()
+	if err = m.rawSendMsgStream(conn, out.Bytes(), authData); err != nil {
 		return false, err
 	}
 
-	msgType, _, dec, err := m.readStream(conn, false)
+	msgType, _, dec, err := m.readStreamInMiddle(bufio.NewReader(conn), authData)
 	if err != nil {
 		return false, err
 	}
@@ -1291,10 +1321,63 @@ func (m *Memberlist) sendPingAndWaitForAck(a Address, ping ping, deadline time.T
 	return true, nil
 }
 
+// Interceptor allows you to add additional envelope/header information around
+// gossip packets and in front of gossip streams.
 type Interceptor interface {
-	InterceptInboundStream(io.Reader) (io.Reader, error)
+	// InterceptInboundStream is called on newly established incoming streams
+	// before anything is done to them. The returned Reader is used in lieu of
+	// the Reader passed into the method for the rest of the stream processing
+	// code.
+	//
+	// If the envelope/header should be authenticated it can be returned as
+	// well here and memberlist code will be sure it ends up in the gcm.Open
+	// authenticated data appropriately.
+	InterceptInboundStream(r io.Reader) (out io.Reader, authData []byte, err error)
+
+	// InterceptOutboundStream is called on newly established outgoing streams
+	// before anything is written to the underlying connection.
 	InterceptOutboundStream(w io.Writer) error
-	InterceptInboundPacket(buf []byte) ([]byte, error)
+
+	// InterceptInboundPacket is called on newly received gossip packets before
+	// anything is done to them. The returned byte slice is used in lieu of the
+	// byte slice passed into the method for the rest of the packet processing
+	// code.
+	//
+	// If the envelope/header should be authenticated it can be returned as
+	// well here and memberlist code will be sure it ends up in the gcm.Open
+	// authenticated data appropriately.
+	InterceptInboundPacket(buf []byte) (out []byte, authData []byte, err error)
+
+	// InterceptOutboundPacket is called with the full contents of outgoing
+	// packets before they are sent so that they can be wrapped as needed.
 	InterceptOutboundPacket(buf []byte) ([]byte, error)
+
+	// InterceptionOverhead is the additional size in bytes of the
+	// interceptor's envelope/header portion.
 	InterceptionOverhead() int
+
+	// InterceptionAuthData is the portion of the interceptor's envelope/header
+	// that should be added to the gcm.Seal operation as authenticated data.
+	InterceptionAuthData() []byte
+}
+
+type noopInterceptor struct{}
+
+func (ni *noopInterceptor) InterceptInboundStream(r io.Reader) (out io.Reader, authData []byte, err error) {
+	return r, nil, nil
+}
+func (ni *noopInterceptor) InterceptOutboundStream(w io.Writer) error {
+	return nil
+}
+func (ni *noopInterceptor) InterceptInboundPacket(buf []byte) (out []byte, authData []byte, err error) {
+	return buf, nil, nil
+}
+func (ni *noopInterceptor) InterceptOutboundPacket(buf []byte) ([]byte, error) {
+	return buf, nil
+}
+func (ni *noopInterceptor) InterceptionOverhead() int {
+	return 0
+}
+func (ni *noopInterceptor) InterceptionAuthData() []byte {
+	return nil
 }
