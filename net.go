@@ -279,7 +279,6 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			return
 		}
 
-		// Since we didn't open the socket, we don't send any interceptor auth data.
 		if err := m.sendLocalState(conn, join, envelopeAuthData); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to push local state: %s %s", err, LogConn(conn))
 			return
@@ -308,7 +307,6 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			return
 		}
 
-		// Since we didn't open the socket, we don't send any interceptor auth data.
 		err = m.rawSendMsgStream(conn, out.Bytes(), envelopeAuthData)
 		if err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to send ack: %s %s", err, LogConn(conn))
